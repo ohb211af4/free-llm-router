@@ -106,12 +106,29 @@ export const BUDDY_CN: VariantConfig = {
  *
  * 端点来自参考项目 `src/product.ts:382-388`：
  * `id: 'workbuddy'`、`platform: 'workbuddy-ai'`、
- * `endpoint: 'https://www.workbuddy.ai'`，并明确注明
- * **「该产品没有每日签到积分接口」**（内核里只有
- * `/v2/billing/meter/get-dosage-notify`）。
+ * `endpoint: 'https://www.workbuddy.ai'`。
  *
- * ⚠️ 故 `checkin: false` 是**如实声明**，不是遗漏 ——
- * 参考项目也因此在 Jet Hub 里不为它渲染「一键领取积分」按钮。
+ * ## 🔴 「国际版没有签到接口」是**误判**，已更正（2026-11-21）
+ *
+ * 本文件此前写 `checkin: false`，理由是「内核里只有 `get-dosage-notify`」。
+ * **那个推理是错的**：签到端点是 **IDE / 网页前端**直调的，CLI 内核里本来
+ * 就不会有 —— 与当年 `get-user-resource`（余额）的误判同型。
+ *
+ * 实测（本项目，2026-11-21，零凭据探测端点存在性）：
+ *
+ * | 端点 | `www.workbuddy.ai` | `copilot.tencent.com` |
+ * |---|---|---|
+ * | `POST /v2/billing/meter/checkin-activity-status` | **401** | **401** |
+ * | `POST /v2/billing/meter/daily-checkin` | **401** | **401** |
+ *
+ * ⇒ **两个版本同形**（401 = 端点存在、只是要鉴权；不存在的路径回 404）。
+ * 参考实现也已用真实凭据跑通国际版全链路。
+ *
+ * ⚠️ 国际版还有一处国内版没有的语义：**每日奖励挂在活动上**。活动没开时
+ * `/daily-checkin` 回 `41000`（活动未开始/已结束），那时真正驱动到账的是
+ * 「当日活跃」（成长中心的连登）。本适配器的 `checkin()` 只做**签到领取**，
+ * 不做活跃上报 —— 因此活动关闭期间它可能如实返回「本次无收益」。
+ * 这是**如实的行为**，不是缺陷。
  */
 /**
  * 若该变体要求「首条必须是 system」，则按需补一条。
@@ -151,10 +168,9 @@ export const WORKBUDDY_INTL: VariantConfig = {
   webBase: 'https://www.workbuddy.ai',
   // ⚠️ 首条必须是 system（见 VariantConfig 上该字段的说明）
   requiresSystemFirst: true,
-  checkin: false,
-  checkinBlockedReason:
-    '国际版没有每日签到积分接口（积分领取在 CodeBuddy 侧完成）——'
-    + '这是上游产品形态，不是本服务的缺失。',
+  // ✅ 已更正：国际版**有**签到端点，与国内版逐字同形（见上方实测表）。
+  // ⚠️ 曾因「CLI 内核里搜不到」而误判为 false —— 而签到端点根本不经过 CLI 内核。
+  checkin: true,
 }
 
 /**
@@ -340,11 +356,25 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
   /**
    * 每日签到。
    *
-   * ⚠️ 只有**国内版**会走到这里（国际版的 `capabilities.checkin` 是 false，
-   * 上游本就没有该接口）。
+   * ✅ **国内版与国际版都会走到这里**（两站端点同形，只有 billing base 不同）。
    *
-   * 幂等由上游业务码保证（已签到返回 `10001`/`1001`，映射为 `alreadyDone`）——
-   * 故重复点击是安全的。
+   * ## ⚠️ 四种结果必须分开报（都是「正常」，只有最后一种是异常）
+   *
+   * | 上游 | 本方法的返回 | 用户看到的 |
+   * |---|---|---|
+   * | `code 0` + 有 credit | `gained > 0` | 签到成功，获得 N |
+   * | `10001`/`1001`/`14001` | `alreadyDone: true` | 今日已签到 |
+   * | **`41000`/`40901`/`1002`/`1003`** | **`inactive` 语义** | **当前无领取资格（活动未开）** |
+   * | 其它非 0 / HTTP 错误 | **抛错** | 签到失败 + 原因 |
+   *
+   * ⚠️ 第三行此前被归成**失败**（落到 `classify()` ⇒ `unknown` ⇒ 抛错）——
+   * 而国际版的每日奖励**挂在活动上**，活动没开时天天回 `41000`。
+   * 后果：面板天天显示「签到失败」，自动签到还会反复重试。
+   * 这条 bug 藏住的原因是任务注释写着「会如实返回无收益」，
+   * 而代码其实抛错了 —— **注释与代码不一致**。
+   *
+   * ⚠️ `inactive` **不能**折成 `alreadyDone: true`：那是在骗用户「今天领过了」。
+   * 两者都 `gained: 0`，但话术完全不同。
    */
   async function checkin(credential: ProviderCredential): Promise<CheckinResult> {
     const effectiveEnv =
@@ -352,11 +382,19 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
         ? (env as Env)
         : ({ ...(env ?? {}), UPSTREAM_BILLING_BASE: bases.billing } as Env)
     const r = await dailyCheckin({ uid: credential.uid, accessToken: credential.accessToken }, effectiveEnv)
-    return {
-      alreadyDone: r.alreadyDone,
-      gained: r.credit,
-      detail: r.alreadyDone ? '今日已签到（幂等命中）' : `签到成功，获得 ${r.credit}`,
+
+    if (r.inactive === true) {
+      return {
+        alreadyDone: false,
+        gained: 0,
+        // ⚠️ 文案要说清「这不是故障」，否则用户会以为签到坏了
+        detail: `当前无领取资格（活动未开始或已结束）：${r.inactiveReason ?? ''}`.trim(),
+      }
     }
+    if (r.alreadyDone) {
+      return { alreadyDone: true, gained: 0, detail: '今日已签到（幂等命中）' }
+    }
+    return { alreadyDone: false, gained: r.credit, detail: `签到成功，获得 ${r.credit}` }
   }
 
   /**

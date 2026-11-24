@@ -32,33 +32,38 @@
  * |---|---|---|---|
  * | 新人注册礼包 | 3000 | 注册时服务端自动发 | 不涉及 |
  * | **桌面端登录奖励** | 3000 | `POST …/login/points/grant` | 见 `grantLoginReward`（**一次性**） |
- * | 每日积分 | 300 | **服务端按日自动发放，无端点** | ❌ 不存在可调用的端点 |
+ * | 每日积分 | 300 | **办公端只读 GET `office/v3/setting_info` 触发** | ✅ `checkin()` |
  *
- * ⚠️ 故 `capabilities.checkin = false`，而**不是** `true`。
- * 依据 `plugin-src/client/credits-capabilities.js:133`：
- * `raccoon: { balance: true, onboardingTasks: true }` —— 登记的是
- * **一次性** `onboardingTasks`，**没有** `dailyCheckin`。
- * 把每日 300 实现成签到按钮会让用户每次点击都必然失败
- * （`src/raccoon-credits.ts:10-18`）。
+ * ## 🔴 「每日积分无端点可触发」是**误判**（2026-11-21 更正）
  *
- * ## ⚠️ 一次性奖励如何如实表达
+ * 旧表的最后一格写的是「服务端按日自动发放，**无端点**」，并据此把
+ * `capabilities.checkin` 定为 `false`。
  *
- * `Provider` 接口**没有** onboarding 方法。两个选择：
+ * **「`/points/v1|v2` 下的 `sign_in` / `check_in` 全 404」这条事实仍然成立**
+ *（本轮复验：`/api/web/points/v1/sign_in` → 404），**但结论下早了**：
+ * 触发器不在 points 前缀下，而在**办公端**的只读 GET 里。
  *
- * - (a) 映射成 `checkin()` 并让 `capabilities.checkin = true` —— ❌ **不行**：
- *   `checkin` 的语义是「每天都有收益」，而该端点幂等一次性（已领过回
- *   `granted:false`）。声明成签到会让面板每天渲染一个必然无收益的按钮。
- * - (b) `checkin: false` + 把 `grantLoginReward` 作为**独立导出函数**暴露，
- *   并在本注释与能力位上写明。✅ **采用这个**。
+ * ⇒ 现在的 `checkin()` 打那次 GET，靠响应里的 `point_grant_popups` 判定
+ * 「本次有没有真的发放」。**`popups` 为空只是「今天此前已结算」，不是失败。**
  *
- * 这样「能力矩阵如实」与「功能可达」两者兼得 —— 与参考项目把它登记为
- * `onboardingTasks`（一个**独立于** `dailyCheckin` 的能力位）是同一口径。
+ * ⚠️ 但**不要**把它描述成「点一下就能签到」：上游没有那个动作，
+ * 我们只是**触发了一次结算**。文案已按这个口径写。
+ *
+ * ## ⚠️ 一次性奖励仍然**不**映射成 `checkin()`
+ *
+ * `checkin()` 现在归**每日**结算（见上），而「桌面端登录奖励」是
+ * **一次性**的（幂等，已领过回 `granted:false`）。两者语义不同，
+ * 混进同一个能力位会让面板每天渲染一个「必然无收益」的按钮。
+ *
+ * ⇒ 一次性奖励仍由本文件导出的 {@link grantLoginReward} 提供，
+ * 不占用 `capabilities.checkin`。
  */
 
 import {
   ProviderError,
   type ChatRequest,
   type Provider,
+  type CheckinResult,
   type ProviderBalance,
   type ProviderCredential,
   type ProviderModel,
@@ -80,6 +85,42 @@ export const RACCOON_LLM_PREFIX = '/api/web/llm/v2'
 export const RACCOON_POINTS_PREFIX = '/api/web/points/v1'
 /** 桌面端端点前缀（含一次性登录奖励）。 */
 export const RACCOON_DESKTOP_PREFIX = '/api/web/desktop/v1'
+
+/**
+ * **办公端**端点前缀 —— 每日积分结算的触发器在这里。
+ *
+ * ## 🔴 「raccoon 没有每日签到」是**误判**（2026-11-21 更正）
+ *
+ * 本文件此前写 `checkin: false`，依据是「`/points/v1|v2` 下 `sign_in` /
+ * `check_in` / `daily` / `claim` / `attendance` 全 404」。
+ *
+ * **那条 404 仍然是事实**（本轮复验：`/api/web/points/v1/sign_in` → 404），
+ * **但结论下早了**：触发器根本不在 points 前缀下，而在**办公端**的
+ * 一个只读 GET 里 —— `GET /api/web/office/v3/setting_info`。
+ *
+ * 实测（本轮，零凭据探测端点存在性）：
+ *
+ * | 端点 | 结果 |
+ * |---|---|
+ * | `GET /api/web/office/v3/setting_info` | **401**（存在，要鉴权） |
+ * | `GET /api/web/points/v1/sign_in` | **404**（不存在） |
+ *
+ * ⇒ 401 = 端点存在。参考实现用真实 token 取证（3 个账号，跨日后首次调用）：
+ * 每号 **+300**、`daily_points` 同步 +300、响应带
+ * `point_grant_popups: [{source:'daily', points:300, expire_at:…}]`；
+ * **紧接着再调一次** ⇒ `popups: []` 且余额不变 ⇒ **按天幂等**。
+ *
+ * ## ⚠️ 它不是「签到接口」，是「每日结算的副作用」
+ *
+ * 语义上必须说清：我们**没有**「签到」这个动作可发。能做的是**打一次只读
+ * GET**，由上游在「当天还没结算」时顺带发放。故：
+ * - 判据只能是 **`point_grant_popups` 非空**（说明本次真的发了）；
+ * - `popups` 为空 **不代表失败**，只代表「今天此前已结算过」⇒ `alreadyDone`。
+ *
+ * ⚠️ 因此**不能**把它登记成「有签到端点」那种语义 —— 见 `capabilities.checkin`
+ * 的实现注释：能力位为 `true`，但说明里写明「由办公端只读接口触发」。
+ */
+export const RACCOON_OFFICE_PREFIX = '/api/web/office/v3'
 
 /**
  * 手机号传输层加密密钥（**公开常量**，`src/raccoon.ts:36-43`）。
@@ -791,6 +832,83 @@ function readNumber(value: unknown): number | undefined {
  * ⚠️ 各池**分开作 package**：它们的有效期与回补规则都不同
  * （每日积分每日刷新、奖励/充值积分长期有效）。
  */
+/**
+ * 每日积分结算（**由办公端的只读 GET 触发**）。
+ *
+ * ## ⚠️ 语义必须说清：我们没有「签到」这个动作可发
+ *
+ * 上游没有 `sign_in` / `check_in` / `daily` / `claim` 这类端点
+ *（实测全 404）。每日 300 是服务端在「当天还没结算」时**顺带**发放的，
+ * 而触发它的是打一次 **只读** 的 `GET /api/web/office/v3/setting_info`。
+ *
+ * ⇒ 判据只能是响应里的 `point_grant_popups`：
+ * - **非空** ⇒ 本次真的发了（`gained` = 各条 `points` 之和）；
+ * - **为空** ⇒ 今天此前已结算过（`alreadyDone: true`），**不是失败**。
+ *
+ * ## ⚠️ 三个不能凭直觉改的点
+ *
+ * 1. **`popups` 为空 ≠ 失败**：把它判成失败，用户会看到「签到失败」而实际
+ *    积分早就到账了 —— 与本项目反复记录的那类「假结论」同型。
+ * 2. **金额取 `popups[].points` 之和，不取余额差**：余额差会被同期其它来源
+ *    （对话消耗、奖励到账）污染，算出来可能是负的。
+ * 3. **不能据此声称「今天已领」以外的信息**：上游不保证发放时刻，
+ *    我们只能说「本次调用有没有触发发放」。
+ *
+ * ⚠️ 该端点**按天幂等**（实测：紧接着再调一次 ⇒ `popups: []`、余额不变），
+ * 故重复点击安全。
+ */
+async function checkin(credential: ProviderCredential, signal: AbortSignal): Promise<CheckinResult> {
+  const envelope = await raccoonRequestOk(
+    credential,
+    `${RACCOON_OFFICE_PREFIX}/setting_info`,
+    { method: 'GET' },
+    signal,
+  )
+  const data = envelope.data
+
+  // `point_grant_popups` 是**唯一**的发放证据。形状异常时如实说，不猜。
+  const rawPopups = data?.point_grant_popups
+  if (rawPopups !== undefined && !Array.isArray(rawPopups)) {
+    throw new ProviderError({
+      provider: 'raccoon',
+      message: 'Raccoon 每日结算响应的 `point_grant_popups` 不是数组：形状无法识别'
+        + `（实际类型 ${typeof rawPopups}），不猜结果`,
+    })
+  }
+  const popups = Array.isArray(rawPopups) ? rawPopups : []
+
+  let gained = 0
+  const names: string[] = []
+  for (const raw of popups) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) continue
+    const record = raw as Record<string, unknown>
+    const points = readNumber(record.points) ?? 0
+    gained += points
+    // ⚠️ 名称可能缺失：缺失时**不编造**一个有意义的池名，用中性占位。
+    names.push(typeof record.display_name === 'string' && record.display_name !== ''
+      ? record.display_name
+      : '积分发放')
+  }
+
+  if (gained > 0) {
+    return {
+      alreadyDone: false,
+      gained,
+      detail: `每日积分已到账 +${gained}（${names.join('、')}）`,
+    }
+  }
+
+  // `popups` 为空 / 全 0 ⇒ 今天此前已结算。**不报失败**（见函数注释第 1 条）。
+  const toast = typeof data?.point_grant_toast === 'string' ? data.point_grant_toast : ''
+  return {
+    alreadyDone: true,
+    gained: 0,
+    detail: toast !== ''
+      ? `今日已结算过（上游提示：${toast}）`
+      : '今日已结算过（本次调用未触发新的发放）',
+  }
+}
+
 async function balance(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderBalance> {
   const envelope = await raccoonRequestOk(
     credential,
@@ -994,7 +1112,19 @@ export const raccoonProvider: Provider = {
   name: 'Raccoon（商汤）',
   capabilities: {
     /**
-     * ✅ 登录可在 Workers 完成（**仅扫码路径**）。
+     * ✅ 登录可在 Workers 完成 —— **走官方授权页 + 手动粘贴回调链接**。
+     *
+     * ## ⚠️ 2026-11-21：扫码路径已死，别再按它理解本项
+     *
+     * 扫码确认页 `/login/mp` 实测 **404**（签发仍成功 ⇒ 用户扫进去只看到
+     * 404 页，界面上零报错）。故登录改走
+     * {@link createRaccoonAuthorizeSession}：官方 `/authorize` 页 → 回跳
+     * `127.0.0.1` 带 `code` → 用户把地址栏粘回面板 →
+     * {@link exchangeRaccoonAuthorizationCode} 换凭据。
+     *
+     * 下面这段「扫码的 code 由客户端自造」的说明**仍然是事实**（轮询端点
+     * 至今可用），但它对应的**入口已不再接线** —— 详见
+     * {@link beginRaccoonQrLogin} 的警示。
      *
      * 依据：扫码的 `code` 由**客户端自造**、服务端只做轮询查询
      * （`src/raccoon.ts:14-17`、`src/raccoon-oauth.ts:112-118`），
@@ -1031,25 +1161,25 @@ export const raccoonProvider: Provider = {
      * `Provider` 接口没有 onboarding 方法 ⇒ 该功能由本文件导出的
      * {@link grantLoginReward} 提供。
      */
-    checkin: false,
     /**
-     * ⚠️ 这不是本服务的缺陷，而是**上游产品形态**。
+     * ✅ **可触发每日结算**（2026-11-21 更正）。
      *
-     * 依据 `plugin-src/client/credits-capabilities.js:133`：
-     * `raccoon: { balance: true, onboardingTasks: true }` —— 登记的是**一次性**
-     * `onboardingTasks`，**没有** `dailyCheckin`。
-     * 每日 300 积分由服务端**按日自动发放**（账单 `biz_type: 'daily_grant'`），
-     * 实测注册后 1 分钟即到账 —— 没有可调用的签到端点。
+     * ## ⚠️ 与「签到」不是同一种东西，文案必须说清
+     *
+     * 上游**没有** `sign_in` / `check_in` 这类端点（实测全 404）。每日 300 是
+     * 服务端在「当天还没结算」时**顺带**发放的，触发方式是打一次**只读**
+     * `GET /api/web/office/v3/setting_info`（见 {@link RACCOON_OFFICE_PREFIX}）。
+     *
+     * ⇒ 能力位为 `true`（面板可以有一个按钮，点下去真的能拿到积分），
+     * 但**不能**承诺「像别家那样点一下就签到」—— 见 `checkin()` 的语义说明。
      */
-    checkinBlockedReason:
-      'Raccoon 的每日积分由服务端自动发放（账单类型 daily_grant），没有可调用的签到端点。'
-      + '这是上游产品形态，不是本服务的缺失 —— 你的积分照常每天到账。',
-
+    checkin: true,
   },
   parseCredential,
   listModels,
   chat,
   balance,
+  checkin,
   /**
    * 429（限流）与 402（余额耗尽）值得换号 —— `Provider` 的缺省语义。
    * 另外补上 401/403：raccoon 的 access_token 寿命约 3 小时
@@ -1088,9 +1218,21 @@ export interface RaccoonQrLoginStart {
 /**
  * 发起一次扫码登录：生成 code、拼出二维码内容、并就地渲染成 SVG。
  *
- * ⚠️ **不碰网络、不碰凭据** —— 纯本地计算，故可离线单测，
- * 也不会因误调接口消耗用户凭据。真正的登录状态由
- * {@link pollRaccoonQrLogin} 轮询得到。
+ * ## 🔴 **本函数已不可用（2026-11-21）—— 不要再接回登录入口**
+ *
+ * 扫码确认页 `https://xiaohuanxiong.com/login/mp` **实测已 404**。
+ * 而签发本身仍是成功的（轮询端点照常回 `pending`）⇒ 若接回入口，
+ * 用户会扫到一个 404 页，而界面上**零报错、日志里也没有任何异常**
+ * —— 这正是它藏了这么久的原因。
+ *
+ * 登录入口现在走 {@link createRaccoonAuthorizeSession}（官方授权页 +
+ * 手动粘贴回调链接）。
+ *
+ * ⚠️ **为什么还保留着**：上游随时可能把 `/login/mp` 修回来，届时这段
+ * 纯本地计算（含二维码渲染）仍可直接复用。但**保留 ≠ 可用** ——
+ * 能力声明与入口都不能引用它。
+ *
+ * ⚠️ **不碰网络、不碰凭据** —— 纯本地计算，故可离线单测。
  */
 export function beginRaccoonQrLogin(): RaccoonQrLoginStart {
   const code = generateQrCode()
@@ -1126,6 +1268,15 @@ export function buildQrLoginUrl(code: string): string {
 
 /**
  * 轮询一次扫码登录状态。
+ *
+ * ## 🔴 **本函数已无调用点（2026-11-21）**
+ *
+ * 理由见 {@link beginRaccoonQrLogin} 的说明：扫码确认页已 404。
+ * 现在登录走 {@link exchangeRaccoonAuthorizationCode}。
+ *
+ * ⚠️ 保留它是因为**协议本身仍然有效**（实测该端点在 2026-11-21 仍回
+ * `{"code":0,...,"data":{"status":"pending"}}`）—— 上游若修回 `/login/mp`，
+ * 这条轮询立刻又能用。但**不要**在没有入口的情况下把它当成「可用能力」。
  *
  * ⚠️ **任何异常都降级为 `pending`**（网络抖动、响应畸形、未知 status）：
  * 轮询是 2 秒一次的循环，偶发失败不应中断整个登录流程；而把未知状态
@@ -1329,5 +1480,215 @@ export async function refreshRaccoonCredential(
     accessToken,
     refreshToken: nextRefresh,
     ...(expMs === undefined ? {} : { expiresAt: expMs }),
+  }
+}
+
+// ───────────────────── 浏览器授权登录（2026-11-21 新增） ─────────────────────
+
+/**
+ * 授权页路径。
+ *
+ * ## ⚠️ 为什么必须换掉扫码那条链（实测 2026-11-21）
+ *
+ * 扫码确认页 `/login/mp` **已 404**（实测 `https://xiaohuanxiong.com/login/mp`
+ * → 404，带不带 code 都一样）。而**签发本身是成功的**
+ * —— 也就是说用户扫进去只会看到一个 404 页，界面上零报错、日志里也没有。
+ *
+ * ⚠️ 且**轮询端点仍然正常**（实测 `login_with_qrcode_code` → 200 +
+ * `{"status":"pending"}`）⇒ 这就是为什么这个缺陷一直没被发现：
+ * 我们的轮询会一直「耐心等待」，而用户那边根本没有可完成授权的页面。
+ *
+ * ## ✅ 官方现在走的是这条
+ *
+ * 参考实现（`raccoon-authorize.ts`，2026-11-17）记录的官方链路：
+ * `GET /authorize?login_source=desktop&appname=…&desktop_callback=loopback
+ *  &redirect=http://127.0.0.1:<port>/auth/callback&state=<64 hex>`
+ * → 用户在页面上确认 → 回跳 `127.0.0.1` 带 `code`
+ * → `POST {auth}/login_with_authorization_code {authorization_code}` 换凭据。
+ *
+ * 与 trae / codearts / lobsterai / gemini 同一条路：回跳落在本机端口，
+ * 我们用**手动粘贴回调链接**接住它。
+ */
+export const RACCOON_AUTHORIZE_PATH = '/authorize'
+
+/** 授权页显示的应用名（官方页面会校验长度 1..100）。 */
+export const RACCOON_AUTH_APPNAME = '商汤小浣熊'
+
+/** 换码端点（`POST`，body 只有一个 `authorization_code`）。 */
+export const RACCOON_AUTHORIZE_EXCHANGE_PATH = '/login_with_authorization_code'
+
+/**
+ * 回跳路径（写死在本机回环地址上）。
+ *
+ * ⚠️ 官方页面的解析器要求它是
+ * `http://127.0.0.1:<4~5 位端口>/auth/callback` 形态（正则校验）。
+ */
+export const RACCOON_LOOPBACK_CALLBACK_PATH = '/auth/callback'
+
+/** 一轮授权登录的会话（全部随登录会话持久化）。 */
+export interface RaccoonAuthorizeSession {
+  /** 64 位小写 hex 的 CSRF 令牌（官方页面要求正好这个形态）。 */
+  state: string
+  /** 回环端口（1024..65535）。 */
+  port: number
+  /** 用户在浏览器里打开的授权页 URL。 */
+  authorizeUrl: string
+  /** 回跳地址（换码时**不需要**它，但文案里要展示给用户看「等的是哪个地址」）。 */
+  redirectUri: string
+}
+
+/**
+ * 生成一轮授权登录会话（**纯本地计算**，不碰网络）。
+ *
+ * ## ⚠️ 三个必须按官方规则构造的字段
+ *
+ * 1. `state` 必须是 **64 位小写 hex**（不是 UUID —— UUID 带连字符，页面会判 null）；
+ * 2. `redirect` 必须是 `http://127.0.0.1:<4~5 位端口>/auth/callback`；
+ * 3. 参数名**只能在**官方白名单里（多一个键整条链接作废）。
+ *
+ * 端口我们随意取一个固定值即可 —— **不需要真的有人监听**：
+ * 用户在本机完成授权后浏览器会打向它并失败，而**地址栏里带着 `code`**。
+ */
+export function createRaccoonAuthorizeSession(port: number = 18082): RaccoonAuthorizeSession {
+  const bytes = crypto.getRandomValues(new Uint8Array(32))
+  let state = ''
+  for (const byte of bytes) state += byte.toString(16).padStart(2, '0')
+  const redirectUri = `http://127.0.0.1:${port}${RACCOON_LOOPBACK_CALLBACK_PATH}`
+  const query = new URLSearchParams({
+    login_source: 'desktop',
+    appname: RACCOON_AUTH_APPNAME,
+    desktop_callback: 'loopback',
+    redirect: redirectUri,
+    state,
+  })
+  return {
+    state,
+    port,
+    redirectUri,
+    authorizeUrl: `${RACCOON_API_BASE}${RACCOON_AUTHORIZE_PATH}?${query.toString()}`,
+  }
+}
+
+/**
+ * 从一段回调 URL 里取出授权码（**纯函数**）。
+ *
+ * 形态：`http://127.0.0.1:18082/auth/callback?code=…&state=…`
+ *
+ * ⚠️ 参考实现记录的参数名在 desktop 形态下是 **`code`**（不是
+ * `authorization_code`）—— 那是页面投递时用的名字，与换码端点的 body 字段
+ * 是两回事，别混用。
+ */
+export function parseRaccoonCallback(rawUrl: string): { code: string; state: string } {
+  const text = rawUrl.trim()
+  const out = { code: '', state: '' }
+  const marker = text.indexOf('?')
+  if (marker < 0) return out
+  const rest = text.slice(marker + 1)
+  // ⚠️ 截掉 hash 段（`?code=x#frag` 会把 `x#frag` 当成值）
+  const hashAt = rest.indexOf('#')
+  const search = new URLSearchParams(hashAt >= 0 ? rest.slice(0, hashAt) : rest)
+  out.code = (search.get('code') ?? search.get('authorization_code') ?? '').trim()
+  out.state = (search.get('state') ?? '').trim()
+  return out
+}
+
+/**
+ * 用一次性授权码换凭据。
+ *
+ * ## ⚠️ 成功门（比「有没有 token」严格）
+ *
+ * 必须有 `access_token`，**并且**满足二者之一：
+ * - 一枚**有效**的 IAM 令牌（`iss` 以 `/iam` 结尾、有 `sub`、`exp` 未过期）；
+ * - 或一枚 `refresh_token`。
+ *
+ * 差一点就**拒绝并给具名原因** —— 存下半截凭据等于存下一个「轮换后什么都不剩」
+ * 的东西（`raccoon-authorize.ts:657-680` 的同一取舍）。
+ *
+ * ⚠️ **只带 `Content-Type` 一个头**（与官方逐字节相同）。
+ */
+export async function exchangeRaccoonAuthorizationCode(
+  code: string,
+  signal: AbortSignal,
+): Promise<ProviderCredential> {
+  let response: Response
+  try {
+    response = await fetch(
+      `${RACCOON_API_BASE}${RACCOON_AUTH_PREFIX}${RACCOON_AUTHORIZE_EXCHANGE_PATH}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ authorization_code: code }),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(RACCOON_REQUEST_TIMEOUT_MS)]),
+      },
+    )
+  } catch (error) {
+    throw new ProviderError({
+      provider: 'raccoon',
+      retryable: true,
+      message: `Raccoon 换码请求失败：${error instanceof Error ? error.message : String(error)}`,
+    })
+  }
+
+  let payload: unknown
+  try {
+    payload = await response.json()
+  } catch {
+    throw new ProviderError({
+      provider: 'raccoon',
+      httpStatus: response.status,
+      message: `Raccoon 换码响应不是 JSON（HTTP ${response.status}）`,
+    })
+  }
+  const envelope = parseEnvelope(payload, response.status)
+  if (envelope.code !== 0 || envelope.data === undefined) {
+    // ⚠️ `200035` = 授权码不存在/已用过 —— 这是**用户最常遇到**的，
+    // 必须能看懂（否则用户会以为整个登录都坏了）。
+    const hint = envelope.code === 200035
+      ? '（授权码已失效或已被用过：它只能换一次，且约几分钟过期 —— 请重新发起登录）'
+      : ''
+    throw new ProviderError({
+      provider: 'raccoon',
+      httpStatus: response.status,
+      message: `Raccoon 换码失败（code=${envelope.code}）：${envelope.message}${hint}`,
+    })
+  }
+
+  const data = envelope.data
+  const accessToken = typeof data.access_token === 'string' ? data.access_token : ''
+  if (accessToken.trim() === '') {
+    throw new ProviderError({
+      provider: 'raccoon',
+      message: 'Raccoon 换码响应缺少 access_token（不产出半截凭据）',
+    })
+  }
+  const refreshToken = typeof data.refresh_token === 'string' ? data.refresh_token : ''
+  // ⚠️ 成功门：IAM 令牌**不要求** refresh；但两者都没有就是不可接受的。
+  if (refreshToken === '' && !isRaccoonIamToken(accessToken)) {
+    throw new ProviderError({
+      provider: 'raccoon',
+      message: 'Raccoon 换码拿到了 access_token，但它既不是有效 IAM 令牌、也没有 refresh_token —— '
+        + '这种凭据一旦过期就无法续期，故拒绝入库（请重新登录）',
+    })
+  }
+
+  // ⚠️ 走**同一个** parseCredential：保证登录与导入落成同一条账号记录。
+  return parseCredential({ ...data })
+}
+
+/**
+ * 判断一枚令牌是不是 IAM 形态（`iss` 以 `/iam` 结尾）。
+ *
+ * ⚠️ **不验签**：签名由服务端负责；这里只决定「成功门走哪一半」。
+ */
+export function isRaccoonIamToken(token: string): boolean {
+  const parts = token.split('.')
+  if (parts.length < 2) return false
+  try {
+    const json = atob((parts[1] ?? '').replaceAll('-', '+').replaceAll('_', '/'))
+    const payload = JSON.parse(json) as Record<string, unknown>
+    const iss = payload.iss
+    return typeof iss === 'string' && iss.endsWith('/iam')
+  } catch {
+    return false
   }
 }

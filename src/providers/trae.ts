@@ -2069,6 +2069,55 @@ export function fixNicknameMojibake(raw: string, uid: string): string {
 }
 
 /**
+ * 把用户粘进来的回调文本归一成**可被 `new URL()` 解析**的完整 URL。
+ *
+ * ## 🔴 为什么需要它（真实缺陷）
+ *
+ * 用户从地址栏复制时，**不带 scheme** 的形态很常见：
+ *
+ * ```
+ * 127.0.0.1:50000/authorize?refreshToken=…&userInfo=…&userJwt=…
+ * ```
+ *
+ * 旧实现只判 `startsWith('http')`，否则一律前置 `http://127.0.0.1` ——
+ * 于是上面那条被拼成
+ * `http://127.0.0.1127.0.0.1:50000/authorize?…`，
+ * **主机名变成 `127.0.0.1127.0.0.1`**，`URL` 仍能解析（所以不会报错！）
+ * 但 **query 全部丢失** ⇒ 报「回调未携带 refreshToken」。
+ *
+ * ⚠️ 这个缺陷**格外难自查**：用户粘的链接明明完整，提示却说缺参数。
+ *
+ * ## 四种形态（都要认）
+ *
+ * | 输入 | 处理 |
+ * |---|---|
+ * | `http(s)://…` | 原样 |
+ * | `/authorize?...` 或 `/login/trae/callback/…` | 前置回环 origin |
+ * | `host:port/...` | 补 `http://`（**不加**回环前缀） |
+ * | 裸 query（`refreshToken=…`） | 补回环 origin + `/authorize?` |
+ *
+ * ⚠️ 「裸 query」的判据必须是「**不含** `/` 且**不含** `?`」——
+ * 用宽口径 `^[^/?#]+:\d+` 判 authority 会把裸 query 里的
+ * `code=123:456` 当成 host `code=123` + 端口 `456`（参考实现踩过）。
+ */
+export function normalizeTraeCallbackUrl(rawUrl: string): string {
+  const text = rawUrl.trim()
+  // ① 完整 URL
+  if (/^https?:\/\//i.test(text)) return text
+  // ② 相对路径（`/authorize?…` / `/login/trae/callback/…`）
+  if (text.startsWith('/')) return `http://127.0.0.1${text}`
+  // ③ `host:port/...` —— **补 scheme 而不是加回环前缀**
+  //    （否则主机名会被拼坏，见上面的缺陷说明）
+  if (/^[^/?#]+:\d+(?:[/?#]|$)/.test(text)) return `http://${text}`
+  // ④ 裸 query（不含路径分隔符，也没有 `?`）
+  if (!text.includes('/') && !text.includes('?')) {
+    return `http://127.0.0.1/authorize?${text.replace(/^\?/, '')}`
+  }
+  // 兜底：交给 URL 去判（解析失败由调用方报「无法解析」）
+  return `http://127.0.0.1${text}`
+}
+
+/**
  * 解析 TRAE 登录回调 URL，提取凭证字段。
  *
  * ## ⚠️ 老流程**直接回传 token**（没有 `?code=`）
@@ -2095,8 +2144,7 @@ export function fixNicknameMojibake(raw: string, uid: string): string {
 export function parseTraeCallback(rawUrl: string): TraeCallbackParseResult {
   let query: URLSearchParams
   try {
-    // 允许传入相对形式（`/login/trae/callback/x?...`），补全成完整 URL 再解析。
-    query = new URL(rawUrl.startsWith('http') ? rawUrl : `http://127.0.0.1${rawUrl}`).searchParams
+    query = new URL(normalizeTraeCallbackUrl(rawUrl)).searchParams
   } catch {
     return { ok: false, reason: '回调 URL 无法解析', authCodeFlow: false }
   }
@@ -2402,32 +2450,33 @@ export const traeProvider: Provider = {
   name: 'TRAE（字节跳动）',
   capabilities: {
     /**
-     * ❌ **不可用**：TRAE **强制回调 `127.0.0.1`**，Worker 接不住。
+     * ✅ **可用** —— 走「**手动粘贴回调链接**」（2026-11-21 改）。
      *
-     * ## 实测结论（用户报障「TRAE 登录显示网络错误，请刷新页面重试」）
+     * ## ⚠️ 先记住这条：TRAE **确实强制回调 `127.0.0.1`**
      *
-     * 我一度以为 `auth_callback_url` 是通用参数、可以指向本服务的 URL
-     *（codearts 就是这么做的，且能通）。**对 TRAE 不成立**：
+     * 这一条实测结论**没有变**，且不要试图推翻它：
      *
      * 1. 参考实现的文件头明写 **「TRAE 强制回调 `127.0.0.1`」**
      *    （`trae-oauth.ts:4-11`），端口固定 18080；
-     * 2. 它的登录流程是 `startCallbackServer(18080)` +
-     *    `auth_callback_url = 'http://127.0.0.1:<port>/authorize'`
-     *    （`trae-oauth.ts:555-566`）—— 回调是**浏览器直连用户本机端口**；
-     * 3. 登录 URL 里的 `auth_type=local` 也在字面上说明这一点
-     *    （`local` = 本机回调）。
+     * 2. 它自己起 `startCallbackServer(18080)` 并在登录 URL 里带
+     *    `auth_callback_url = 'http://127.0.0.1:<port>/authorize'`；
+     * 3. 登录 URL 的 `auth_type=local` 字面上就是「本机回调」。
      *
-     * 故用户看到的是 **TRAE 页面自己报的「网络错误」**（它去连
-     * `127.0.0.1:18080` 但那里没有服务在监听），
-     * 而不是我们的回调页 —— 这也解释了为什么那条文案在本仓库里搜不到。
+     * ⇒ 把 `auth_callback_url` 换成本服务的地址**不成立**（浏览器那一程
+     * 会停在 TRAE 页面的「网络错误」）。这条此前也踩过，**别再试**。
      *
-     * ⚠️ **不要靠「把地址换成本服务 URL」来修**：这条路在架构上不成立。
-     * 除非 TRAE 将来支持设备码或远程回调，否则只能「粘贴凭据导入」。
+     * ## ⇒ 所以走的是另一条：让用户把地址栏**粘回来**
+     *
+     * 回调落不到我们这里，但**它落在用户浏览器的地址栏里**，而且带全了
+     * 凭证材料（`refreshToken` / `userInfo` / `userJwt`）。
+     * `/admin/providers/login/submit-callback` 接收这段 URL，
+     * 复用与浏览器回调**同一份** `parseTraeCallback` 解析，再由面板轮询去
+     * `ExchangeToken` 换取凭据（轮换型 refreshToken 只能有一个交换出口）。
+     *
+     * 这条路径**不需要任何本地端口**，也不需要上游配合 —— 它只是「人工搬运」。
+     * 同理适用于手机 / 另一台电脑上完成授权的场景。
      */
-    login: false,
-    loginBlockedReason:
-      'TRAE 强制回调 127.0.0.1（本机端口），Worker 收不到 —— 这是上游的协议限制，'
-      + '不是本服务的缺失。请从 TRAE 客户端导出凭据后粘贴导入。',
+    login: true,
     listModels: true,
     chat: true,
     balance: true,

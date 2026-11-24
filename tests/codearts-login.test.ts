@@ -23,6 +23,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 
 import {
   buildCodeArtsCallbackUrl,
@@ -414,7 +415,7 @@ test('⚠️ 服务端万一同时下发续期材料，必须透传（否则可�
 
 // ─────────────────── ⑦ 能力声明 ───────────────────
 
-test('❌ codearts 必须声明 login=false —— 华为登录链在服务端就是死循环', () => {
+test('❌ codearts 登录入口已关掉（用户实测走不通）—— 但供应商本身保留', () => {
   // ## 被用户两次真实登录推翻的结论（2026-10-04）
   //
   // 用户登录后被送到**华为自己的中间页**（不是我们的回调）：
@@ -432,11 +433,59 @@ test('❌ codearts 必须声明 login=false —— 华为登录链在服务端�
   //
   // 参考实现能成是因为它用 `http://127.0.0.1:<port>/authentication`，
   // 浏览器**直连本机端口**，不经过 authui/login 的二次跳转。Worker 收不到。
+  //
+  // ## ⇒ 2026-11-21：改走「手动粘贴回调链接」
+  //
+  // 上面那些事实**一个字没变**（跳转链照样死循环、`auth_callback_url` 照样不被读）。
+  // 变的是结论：登录**确实会在用户浏览器里完成一次**，而那一刻地址栏带着
+  // `?secret=…`。让用户把它粘回来即可，不需要本地端口。
+  // ## 2026-11-21：用户实测两次都走不通，要求关掉
+  //
+  // > 「而且华为还是不行，去掉吧」
+  //
+  // ⚠️ 关掉的是**入口**，不是供应商 —— 已导入的账号必须照常可用。
   const provider = findProvider('codearts')
-  assert.equal(provider?.capabilities.login, false, 'codearts 不能声称支持登录')
+  assert.notEqual(provider, undefined, '⚠️ 供应商本身必须**保留**（已导入的账号还要能用）')
+  assert.equal(provider?.capabilities.login, false, 'codearts 不应声称可从本服务登录')
+
+  // ⚠️ `login: false` **必须**给出可读原因（`types.ts` 的诚实纪律）。
+  // 而且要说明**为什么「粘贴回调链接」也救不了它** —— 否则用户会问
+  // 「别的家都能粘，为什么华为不行」。
+  const reason = provider?.capabilities.loginBlockedReason ?? ''
+  assert.ok(reason.includes('127.0.0.1'), '原因要点明回调只认本机端口')
+  assert.ok(reason.length > 40, '原因要足够具体（不能只说「不支持」）')
+
+  // ⚠️ 而**能力**不能连带关掉：对话/签到/余额/续期都还在。
+  assert.equal(provider?.capabilities.chat, true, '已导入的 codearts 账号必须仍能对话')
+  assert.equal(provider?.capabilities.checkin, true, '签到能力不受登录入口影响')
+  assert.equal(typeof provider?.refresh, 'function', '续期不受登录入口影响')
+
+  // ⚠️ 前端也不得再为它渲染「粘贴回调链接」输入框（用户没有可粘的东西）。
+  const js = readFileSync('src/panel/assets/app.js.txt', 'utf8')
+  const setMatch = /const MANUAL_CALLBACK_PROVIDERS = new Set\(\[([^\]]*)\]\)/.exec(js)
+  assert.ok(setMatch !== null, '应有 MANUAL_CALLBACK_PROVIDERS')
   assert.ok(
-    (provider?.capabilities.loginBlockedReason ?? '').includes('127.0.0.1'),
-    '阻塞原因必须点明是「回调只认本机 127.0.0.1」',
+    !setMatch[1].includes('codearts'),
+    '⚠️ codearts 不得出现在「手动回调」名单里（它走不到回调页，粘不了）',
+  )
+
+  // ⚠️ 判据必须打在**真实接线**上：只翻 `login: true` 而没有入口，
+  // 用户点「登录」会得到「不支持从本服务发起登录」—— 那是空头承诺。
+  const index = readFileSync('src/index.ts', 'utf8')
+  const i = index.indexOf("path === '/admin/providers/login/submit-callback'")
+  assert.ok(i >= 0, '必须存在手动提交回调的端点')
+  const block = index.slice(i, i + 6000)
+  assert.ok(
+    block.includes('parseCodeArtsCallbackQuery('),
+    'codearts 的提交入口必须复用 parseCodeArtsCallbackQuery（不得另写一份解析）',
+  )
+
+  // ⚠️ 而**回调处理器**本身就复用同一份 —— 同一件事只能有一个实现。
+  const handler = index.indexOf('async function handleCodeArtsCallback(')
+  assert.ok(handler >= 0)
+  assert.ok(
+    index.slice(handler, handler + 6000).includes('parseCodeArtsCallbackQuery('),
+    '回调处理器也必须调同一个纯函数（否则两处判据会分叉）',
   )
 })
 

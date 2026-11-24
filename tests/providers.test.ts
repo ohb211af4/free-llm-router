@@ -35,6 +35,7 @@ import assert from 'node:assert/strict'
 
 import {
   DEFAULT_PROVIDER,
+  LEGACY_PROVIDER,
   findProvider,
   PROVIDERS,
   parseCredentialAnywhere,
@@ -43,6 +44,7 @@ import {
   requireProvider,
 } from '../src/providers/index.ts'
 import { ProviderError, splitModelName } from '../src/providers/types.ts'
+import * as minimaxModule from '../src/providers/minimax.ts'
 import { anthropicSseToOpenAiSse } from '../src/providers/anthropic.ts'
 import { planGrowth, REAL_CHAT_ACTIONS } from '../src/taskrunner/plans.ts'
 import { registeredActions } from '../src/taskrunner/actions.ts'
@@ -123,9 +125,17 @@ test('空模型名不崩', () => {
 
 // ─────────────────── 注册表 ───────────────────
 
-test('默认供应商在注册表里且是第 0 项（顺序有语义）', () => {
-  assert.equal(providerIds()[0], DEFAULT_PROVIDER)
+test('默认供应商必须已注册（但**不再**要求是注册表第 0 项）', () => {
+  // ⚠️ 2026-11-21 改造：默认供应商从「注册表第 0 项」改为**显式声明**。
+  //
+  // 原因见 `src/providers/index.ts` 的 `DEFAULT_PROVIDER` 注释：注册表顺序
+  // 同时被用作「自动识别凭据的尝试次序」和「猜默认供应商」，两件事被绑死，
+  // 任何一边的编辑都会悄悄影响另一边；且 `array[0]` 会被新加的供应商挤动。
+  //
+  // 仍然必须成立的那一条：默认供应商**必须是已注册的**，否则裸模型名会
+  // 回落到一个 `findProvider` 查不到的家。
   assert.notEqual(findProvider(DEFAULT_PROVIDER), undefined)
+  assert.ok(providerIds().includes(DEFAULT_PROVIDER))
 })
 
 test('⚠️ requireProvider 未知供应商时抛错并列出可用项', () => {
@@ -184,10 +194,41 @@ test('⚠️ 默认供应商必须支持 chat（否则裸模型名全部失败�
 // ─────────────────── 凭据解析 ───────────────────
 
 test('⚠️ WorkBuddy 必须最后试（它的解析最宽松，会吞掉别家的凭据）', () => {
-  // 这条断言用一个「WorkBuddy 能认、但更像别家」的输入来验证顺序。
-  // 只要默认供应商是兜底项，任何多供应商歧义输入都应先被别家拿走。
-  const providers = providerIds()
-  assert.equal(providers[0], DEFAULT_PROVIDER, '默认供应商应在首位（兜底语义）')
+  // ## 实测缺陷（本用例守护的东西）
+  //
+  // WorkBuddy 的凭据形态最宽松（只要 `accessToken` + `uid`），故它**必须**
+  // 排在自动识别的最后。否则任何 `{accessToken, uid}` 形态的对象都会被它
+  // 抢走 —— 用户看到「导入成功」，实际存成了一个必然 401 的 WorkBuddy 账号。
+  //
+  // ## ⚠️ 判据已改为**行为级**（2026-11-21）
+  //
+  // 旧写法是 `assert.equal(providerIds()[0], DEFAULT_PROVIDER)` —— 它假设
+  // 「默认供应商 = 注册表第 0 项 = 被排到最后的那家」。这三个概念已被解耦，
+  // 且它**从未真正验证过兜底行为**（只比了一个数组下标，是空断言）。
+  //
+  // 现在直接验行为：给一个 buddy 能认、但**更像别家**的输入，
+  // 结果必须**不是** buddy。
+  const buddyOnly = parseCredentialAnywhere({
+    accessToken: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLTEifQ.c2ln',
+    uid: 'user-1',
+  })
+  assert.equal(
+    buddyOnly.provider.id,
+    'buddy',
+    '裸 WorkBuddy 形态仍应被 buddy 收下（它是兜底）',
+  )
+
+  // 而带别家独有字段的输入，必须被**那一家**拿走，不能落到 buddy。
+  const traeShape = parseCredentialAnywhere({
+    access_token: 'x',
+    machine_id: 'm',
+    device_id: 'd',
+    uid: 'u',
+  })
+  assert.equal(traeShape.provider.id, 'trae', '带 TRAE 独有字段的对象必须判给 trae')
+
+  // ⚠️ 且**兜底项本身**必须是 buddy —— 这是上面那些行为的前提。
+  assert.equal(LEGACY_PROVIDER, 'buddy', '兜底供应商（最宽松的那家）必须是 buddy')
 })
 
 test('完全无法识别的输入抛错，且带上**每一家**的拒绝原因', () => {
@@ -358,16 +399,33 @@ test('⚠️ checkin=false 的供应商必须给出可读原因（否则用户�
   assert.deepEqual(missing, [], `这些供应商声明了 checkin=false 却没给原因：${missing.join('、')}`)
 })
 
-test('⚠️ raccoon 的 checkin 必须是 false（上游确实没有该端点）', () => {
-  // 依据参考项目 plugin-src/client/credits-capabilities.js:133：
-  // `raccoon: { balance: true, onboardingTasks: true }` —— 无 dailyCheckin。
-  // 每日 300 是服务端按日自动发放（账单 biz_type: 'daily_grant'）。
+test('✅ raccoon 可触发每日结算（不是「签到」，是只读 GET 的副作用）', () => {
+  // ## 结论已更正（2026-11-21）
+  //
+  // 旧断言是 `checkin === false`，依据「`/points/v1|v2` 下 sign_in/check_in 全 404」。
+  // **那条 404 仍然成立**，但结论下早了：触发器在**办公端**的只读 GET
+  // `office/v3/setting_info` 里（实测本轮：该端点 **401** = 存在要鉴权，
+  // 而 `points/v1/sign_in` 是 **404**）。
+  //
+  // ⚠️ 语义差别必须记住：上游**没有**「签到」这个动作，我们只是**触发了一次
+  // 结算**。故 `gained` 只能取自 `point_grant_popups`，而 popups 为空
+  // **不是失败**（只代表今天此前已结算）。
   const raccoon = findProvider('raccoon')
   assert.notEqual(raccoon, undefined)
-  assert.equal(raccoon?.capabilities.checkin, false, 'raccoon 不该声明支持签到')
+  assert.equal(raccoon?.capabilities.checkin, true, 'raccoon 应可触发每日结算')
+  assert.equal(typeof raccoon?.checkin, 'function', '声明 checkin=true 就必须实现方法')
+
+  // ⚠️ 判据必须是 `point_grant_popups`（唯一的发放证据）
+  const src = readFileSync('src/providers/raccoon.ts', 'utf8')
+  assert.ok(src.includes('point_grant_popups'), '必须读 point_grant_popups 作为发放证据')
+  assert.ok(src.includes('/office/v3'), '必须打办公端的 setting_info（触发器在这里）')
+  // ⚠️ 且 popups 为空**不得**抛错（那会把「今天已结算」误报成失败）
+  const fnStart = src.indexOf('async function checkin(')
+  assert.ok(fnStart > 0)
+  const fn = src.slice(fnStart, src.indexOf('\nasync function balance', fnStart))
   assert.ok(
-    (raccoon?.capabilities.checkinBlockedReason ?? '').includes('自动发放'),
-    '原因里应说明「服务端自动发放」，否则用户仍会困惑',
+    !/popups\.length === 0\)\s*\{\s*throw/.test(fn),
+    'popups 为空时不得抛错',
   )
 })
 
@@ -391,14 +449,24 @@ test('⚠️ 声明 checkin=true 的供应商都必须实现 checkin 方法', ()
   assert.deepEqual(broken, [], `声明了支持签到却没实现：${broken.join('、')}`)
 })
 
-test('腾讯双变体：buddy 有签到，workbuddy（国际版）没有', () => {
+test('腾讯双变体**都有**签到（国际版「无接口」是已更正的误判）', () => {
+  // ## ⚠️ 这条断言此前写反了（2026-11-21 更正）
+  //
+  // 旧断言是 `intl.checkin === false`，理由是「CLI 内核里只有 get-dosage-notify」。
+  // **那个推理是错的**：签到端点是 IDE / 网页前端直调的，CLI 内核里本来就不会有
+  // —— 与当年 `get-user-resource`（余额）的误判同型。
+  //
+  // 实测（零凭据探测端点存在性）：`/v2/billing/meter/checkin-activity-status`
+  // 与 `/v2/billing/meter/daily-checkin` 在 **workbuddy.ai 与 copilot.tencent.com
+  // 上都回 401**（401 = 存在但要鉴权；不存在的路径回 404）⇒ 两站**同形**。
   const buddy = findProvider('buddy')
   const intl = findProvider('workbuddy')
   assert.notEqual(buddy, undefined)
   assert.notEqual(intl, undefined)
   assert.equal(buddy?.capabilities.checkin, true, '国内版有签到')
-  assert.equal(intl?.capabilities.checkin, false, '国际版无签到接口')
-  assert.ok((intl?.capabilities.checkinBlockedReason ?? '').length > 10, '国际版也要说明原因')
+  assert.equal(intl?.capabilities.checkin, true, '国际版也有签到（端点同形，实测 401 存在）')
+  // ⚠️ 声明为 true 就**必须**真的挂上方法（只声明不挂 = 空头承诺）
+  assert.equal(typeof intl?.checkin, 'function', 'workbuddy 必须挂上 checkin 方法')
 })
 
 test('腾讯双变体都能设备码登录（实测国际版返回 workbuddy.ai 的 authUrl）', () => {
@@ -587,7 +655,19 @@ test('🔴 minimax 必须挂上 refresh（否则 token 过期后账号永久 401
   // `types.ts` 的说明）。故连单测一起补上，防第 3 次。
   const src = readFileSync('src/providers/minimax.ts', 'utf8')
   assert.ok(/^async function refresh\(/m.test(src), '应有 refresh 函数')
-  assert.ok(/^  refresh,$/m.test(src), '⚠️ 必须**挂到 provider 对象**上（只定义不挂 = 等于没有）')
+  // ⚠️ 判据必须打在**活对象**上，不能只 grep 源码文本。
+  //
+  // 本站点的 provider 已参数化（`buildMinimaxProvider(site)`），挂载写法从
+  // `refresh,` 变成 `refresh: (credential, signal) => refresh(credential, signal, site)`
+  // —— 而源码文本断言会把这种**正确**的等价改写判成失败（假红）。
+  // 真判据只有一个：**运行时这两个 provider 的 `refresh` 都是函数**。
+  const { minimaxProvider, minimaxIntlProvider } = minimaxModule
+  for (const [label, provider] of [
+    ['minimax', minimaxProvider],
+    ['minimaxintl', minimaxIntlProvider],
+  ] as const) {
+    assert.equal(typeof provider.refresh, 'function', `⚠️ ${label}.refresh 必须挂到 provider 对象上（只定义不挂 = 等于没有）`)
+  }
   // 端点与参数必须逐字对（client_id 错了上游回 invalid_client）
   assert.ok(src.includes("'/oauth2/token'"), '端点应为 /oauth2/token')
   assert.ok(src.includes("'mcode-public'"), 'client_id 必须是官方常量 mcode-public')
@@ -698,6 +778,37 @@ test('🔴 zcode 签到前**必须**补发客户端活跃上报（否则 preview
   // 上报失败不能阻塞签到
   assert.ok(/catch \{[\s\S]{0,120}\}/.test(block.slice(reportAt - 200, reportAt + 2000)),
     '上报失败应被兜住（不阻塞）')
+})
+
+test('🔴 qoder 额度码是一条链（110 + 112），且 pricingUrl 文案腿独立成立', async () => {
+  // ## 真实缺陷（参考实现 IKKJFH，本项目已移植修复）
+  //
+  // 上游的「额度用尽」不止一种码。只认 `110` 时，`112` 三条判据全 false
+  // ⇒ 错误被归成「服务端故障」⇒ ① 白退避重试；② **既不换号、也不换 provider**。
+  // 用户看到的是「轮换没生效」，而真实原因是**我们没认出这是额度问题**。
+  const { looksLikeQoderBillingError, QODER_BILLING_CODES } = await import('../src/providers/qoder.ts')
+
+  // ① 码值腿：两个码都要算额度 —— 字符串与数字两种编码都认
+  for (const code of QODER_BILLING_CODES) {
+    assert.equal(looksLikeQoderBillingError({ code }), true, `code=${code}（字符串）必须算额度`)
+    assert.equal(looksLikeQoderBillingError({ code: Number(code) }), true, `code=${code}（数字）必须算额度`)
+  }
+  // ⚠️ 反向：集合必须**两个都在**（写回 ['110'] 时本断言变红）
+  assert.equal(QODER_BILLING_CODES.includes('110'), true)
+  assert.equal(QODER_BILLING_CODES.includes('112'), true)
+
+  // ② 文案腿：`112` 的报文只带 pricingUrl，**没有任何自然语言说明**
+  assert.equal(
+    looksLikeQoderBillingError('{"pricingUrl":"https://qoder.com.cn/pricing?client=qoder"}'),
+    true,
+    'pricingUrl 报文必须算额度（这是 112 的唯一线索）',
+  )
+  assert.equal(looksLikeQoderBillingError({ pricingUrl: 'https://qoder.com.cn/pricing' }), true)
+
+  // ③ 不误伤：`10605`（排队）与泛词都不算额度
+  assert.equal(looksLikeQoderBillingError({ code: '10605' }), false, '排队不是额度问题')
+  assert.equal(looksLikeQoderBillingError('模型余额与额度讨论，请查看 pricing 页面'), false,
+    '自然语言里的 pricing/额度 不算（判据是结构字段，不是主题词）')
 })
 
 test('🔴 qoder 排队必须有**总墙钟预算**（只有次数上限会让请求挂到被平台掐断）', () => {
@@ -978,6 +1089,43 @@ test('🔴 loomy 第二步必须复用 findLoginSession（不能自己解析 get
     '⚠️ 不得自己再写一遍分片查找循环')
 })
 
+test('🔴 保活续期：TTL 以天计的家必须在闲置 7 天后主动续一次', () => {
+  // ## 真实缺陷（参考实现 issue #124）
+  //
+  // 腾讯系的 access_token 有效期**以天计**（实测 60 / 30 / 28 天三批）。
+  // 而 lead-time 判据只在「距过期不足 1 小时」放行 ⇒ 每小时那轮 cron 全部跳过
+  // ⇒ refresh_token 闲置 28 天后被服务端作废：`401 {"code":12153,...}`。
+  // 用户看到「凭据过期」，真实原因是**我们让它闲置太久**。
+  const src = readFileSync('src/index.ts', 'utf8')
+
+  // ① 两条腿必须**同时**在续期判据里
+  assert.ok(/dueByExpiry/.test(src) && /dueByKeepAlive/.test(src),
+    '续期判据必须是「到期腿 ∨ 保活腿」')
+  assert.ok(/if \(!dueByExpiry && !dueByKeepAlive\) continue/.test(src),
+    '两条腿取或后必须能跳过（否则每轮都续）')
+
+  // ② ⚠️ 保活必须**限定在家**——推广到 TTL≈1h 且 refresh_token 一次性的家
+  //    会把它们的令牌烧光（本项目丢过账号）。
+  assert.ok(/KEEPALIVE_PROVIDERS/.test(src), '必须有「哪些家适用保活」的白名单')
+  const white = src.slice(src.indexOf('KEEPALIVE_PROVIDERS: ReadonlySet'), src.indexOf('KEEPALIVE_PROVIDERS: ReadonlySet') + 200)
+  assert.ok(/buddy/.test(white) && /workbuddy/.test(white), '两家腾讯变体都要在保活名单里')
+  assert.ok(!/codearts|gemini|minimax|lobsterai|trae/.test(white),
+    '⚠️ TTL≈1h / 一次性 refresh_token 的家**不得**进保活名单')
+
+  // ③ 7 天窗口（不是「TTL 的百分比」也不是更短的值）
+  assert.ok(/KEEPALIVE_MAX_IDLE_MS = 7 \* 24 \* 60 \* 60 \* 1000/.test(src),
+    '保活窗口必须是 7 天（依据见常量注释的三条取舍）')
+
+  // ④ ⚠️ `REFRESH_LEAD_MS` 必须**保持 1 小时**：它是九家共用的，
+  //    改大等于让快到期的家每轮都续（会烧掉一次性 refresh_token）。
+  assert.ok(/const REFRESH_LEAD_MS = 3_600_000/.test(src),
+    'REFRESH_LEAD_MS 必须仍是 1 小时')
+
+  // ⑤ 解不出 `iat` 必须退化成旧行为（不保活），不能「立刻续」
+  assert.ok(/if \(issuedAt <= 0\) return false/.test(src),
+    '解不出 iat 时应退化（不保活），而不是每轮白刷')
+})
+
 test('🔴 cron 必须做**主动续期**（否则每次凭据过期都先失败一批请求）', () => {
   // ## 用户报「其它账号的稳定性能不能提升一下，动不动就掉登录」
   //
@@ -1041,26 +1189,49 @@ test('🔴 每家 provider 都必须有 matchesShape（否则自动识别永远�
   // 用户很难联想到判别式缺失。
   //
   // 本测试**动态**遍历注册表，新增供应商若忘了加判别式会立刻失败。
-  const src = readFileSync('src/providers/index.ts', 'utf8')
-  const registry = src.slice(src.indexOf('export const PROVIDERS'))
-  const ids = [...registry.matchAll(/^\s{2}(\w+Provider),$/gm)].map((m) => m[1])
-  assert.ok(ids.length >= 12, `应解析出全部 provider（实际 ${ids.length}）`)
+  // ⚠️⚠️ **必须打运行时对象，不能 grep 源码**（2026-11-21 实测到假阳性）
+  //
+  // 旧写法是「按变量名推出文件名，再在该文件里 grep `matchesShape`」。
+  // 本轮新增两家**共用实现文件**的变体（`qodercn` 在 `qoder.ts`、
+  // `minimaxintl` 在 `minimax.ts`）—— 于是那两家**根本不需要自己声明**
+  // 判别式，却因为同文件里另一个 provider 声明了而**通过检查**。
+  //
+  // 而它们**故意不声明**判别式（两站凭据形状无法区分，声明会让自动识别
+  // 把国际版凭据判给中国版）。⇒ 这条检查必须改成「按 id 查活对象」，
+  // 并把「共用文件变体」显式登记为豁免 —— 否则下次新增变体会再次假绿。
+  const EXEMPT: ReadonlySet<string> = new Set([
+    // 两站凭据逐字段相同，无法靠形状区分 ⇒ 只接受显式声明。
+    'qodercn',
+    'minimaxintl',
+    // 本来就只支持「粘贴 API Key」，不参与对象形态的自动识别。
+    'opencode',
+    // ⚠️ 它是**兜底**（见 `buddy.ts:183-185` 与 `providers/index.ts` 的
+    // `parseCredentialAnywhere`）：形态最宽松（只要 accessToken+uid），
+    // 声明的判别式反而会**抢走别家的凭据**。它由排序机制保证「最后试」，
+    // 不需要也不应该有 `matchesShape`。
+    'buddy',
+  ])
 
   const missing: string[] = []
-  for (const name of ids) {
-    // provider 的实现文件与变量名的对应：去掉结尾的 Provider 并转小写
-    const base = name.replace(/Provider$/, '').toLowerCase()
-    const file = `src/providers/${base}.ts`
-    if (!existsSync(file)) continue
-    const body = readFileSync(file, 'utf8')
-    // ⚠️ 两种挂载形态都算：`matchesShape(input) {` 与 `matchesShape: xxx,`
-    if (!/^\s*matchesShape[(:]/m.test(body)) missing.push(`${name} (${file})`)
+  for (const provider of PROVIDERS) {
+    if (EXEMPT.has(provider.id)) continue
+    if (typeof provider.matchesShape !== 'function') missing.push(provider.id)
   }
   assert.deepEqual(
     missing,
     [],
     '⚠️ 以下 provider 缺 matchesShape，自动识别时会被跳过、凭据被别家认走：'
       + missing.join('、'),
+  )
+
+  // ⚠️ 豁免名单不许悄悄变长：每加一项都必须在这里说明理由（上面那段注释）。
+  assert.ok(EXEMPT.size <= 4, '豁免名单只应有共用实现的双站变体、纯 API Key 家与兜底家')
+
+  // ⚠️ 而**兜底家之外**的国际版/中国版变体必须靠「不参与识别」来区分的，
+  // 不能两边都声明（否则同一份凭据会按注册顺序判给先注册的那家）。
+  assert.ok(
+    typeof findProvider('workbuddy')?.matchesShape === 'function',
+    '国际版必须声明判别式（它靠 domain / platform 区分，与国内版不同）',
   )
 })
 
@@ -2088,15 +2259,13 @@ test('Gemini 余额：只认两个 bucketId，比例如实报成百分比（不�
   }
 })
 
-test('Gemini 能力声明：login=false 必须给出可读原因，checkin=false 同理', async () => {
+test('Gemini 能力声明：login=true（手动回调），checkin=false 必须给出可读原因', async () => {
   const { geminiProvider, listModels } = await import('../src/providers/gemini.ts')
   assert.equal(geminiProvider.id, 'gemini')
   assert.equal(geminiProvider.name, 'Gemini (Cloud Code Assist)')
-  assert.deepEqual(geminiProvider.capabilities.login, false)
-  // ⚠️ 登录不可用**必须解释为什么**（用户才知道该怎么办），
-  // 空文案或「不支持」会让用户以为是本服务的缺陷。
-  assert.match(geminiProvider.capabilities.loginBlockedReason ?? '', /localhost|回调/,
-    'login=false 必须说明是本地回调不可用')
+  // ⚠️ 2026-11-21：登录改走「手动粘贴回调链接」，故 login 翻 true。
+  // 仍成立的那条：Google 只允许 loopback 重定向（那正是必须走手动回调的原因）。
+  assert.deepEqual(geminiProvider.capabilities.login, true)
   assert.equal(geminiProvider.capabilities.checkin, false)
   assert.ok((geminiProvider.capabilities.checkinBlockedReason ?? '').length > 10)
   // ⚠️ 刻意不声明裸字符串判别式：Gemini 凭据只有 JSON 对象形态，
@@ -2207,4 +2376,80 @@ test('🔴 TRAE / LobsterAI / OpenCode 都必须交出真实倍率（上游一�
   // ④ 🔴 冷启动必须主动拉能力表 —— 否则上面那条并集永远拿不到右侧
   assert.ok(/await refreshCapabilities\(\)/.test(oc),
     '⚠️ 能力表冷启动必须主动拉取（原实现只被自己的 stale 分支调用 ⇒ 永远不拉）')
+})
+
+test('🔴 workbuddy 的存储 key 必须带前缀（只有 buddy 是裸 uid）', async () => {
+  // ## 真实缺陷（本轮实测到）
+  //
+  // 我把 `workbuddy` 也写进了「裸 uid」白名单（理由「两个腾讯变体同族」）——
+  // 那是错的。旧规则是 `providerId === DEFAULT_PROVIDER ? uid : `p:uid``，
+  // 而当时默认供应商是 **buddy** ⇒ **buddy 裸 uid、workbuddy 带前缀**。
+  //
+  // 后果（线上实测）：同一个 `zihang518@gmail.com` 在 global 分片里出现**两条**
+  // 记录（`workbuddy:46a2…` 旧的 + `46a2…` 新导的），而停用/冷却标记仍挂在
+  // 旧 key 上 —— 表现是「禁用了旧的那条，新的照旧可用」。
+  const src = readFileSync('src/index.ts', 'utf8')
+  const m = /const BARE_UID_PROVIDERS: ReadonlySet<string> = new Set\(\[([^\]]*)\]\)/.exec(src)
+  assert.ok(m !== null, '应有 BARE_UID_PROVIDERS')
+  const ids = m[1].split(',').map((x) => x.trim().replace(/['"]/g, '')).filter(Boolean)
+  assert.deepEqual(ids, ['buddy'], '⚠️ 只有 buddy 用裸 uid；workbuddy 必须带 workbuddy: 前缀')
+})
+
+test('🔴 腾讯系指纹：三枚 Conv 头必须全发，且 IDE 版本必须是 genieVersion', async () => {
+  // ## 缺陷一：Conv 三头缺一枚 ⇒ 特定账号 100% 400/11128
+  //
+  // 参考实现 IKM7SG：**部分账号**对 `X-Conversation-*` 做渠道校验，
+  // **缺任一枚即回 `{"code":11128,"msg":"request illegal"}`**
+  // （伪装成「内容未通过安全审核」），整条渠道不可用。
+  // 且**无法预先知道哪个账号会要求**（复验 2/5）⇒ 必须无条件全发。
+  //
+  // 本项目此前：`referenceChatHeaders`（对话主路径）**完全没发**这三枚；
+  // `cliChatHeaders` 只发两枚（`X-Conversation-ID` 只在「入站透传值非空」才发，
+  // 而 chat 路径两个调用点都不传 ⇒ **那一枚从来没发出去过**）。
+  const { referenceChatHeaders, cliChatHeaders } = await import('../src/upstream/headers.ts')
+
+  for (const variant of ['buddy', 'workbuddy'] as const) {
+    const h = referenceChatHeaders({ uid: 'u', accessToken: 't', variant })
+    const conv = ['X-Conversation-ID', 'X-Conversation-Request-ID', 'X-Conversation-Message-ID']
+    for (const k of conv) {
+      assert.ok(typeof h[k] === 'string' && h[k].length > 0, `${variant}: ${k} 必须存在且非空`)
+    }
+    // ⚠️ 参考实现三枚**同值**（三行都是 set(..., conversationId)）；判据不校验值语义
+    assert.equal(new Set(conv.map((k) => h[k])).size, 1, `${variant}: 三枚应同值（与参考实现一致）`)
+  }
+
+  // cliChatHeaders 在没有入站 conversationId 时也必须发满三枚
+  const c = cliChatHeaders({
+    uid: 'u', machineId: 'm', sessionId: 's', accessToken: 't',
+    conversationRequestId: 'a'.repeat(32),
+  })
+  for (const k of ['X-Conversation-ID', 'X-Conversation-Request-ID', 'X-Conversation-Message-ID']) {
+    assert.ok(typeof c[k] === 'string' && c[k].length > 0, `cliChatHeaders: ${k} 必须非空`)
+  }
+})
+
+test('🔴 IDE 版本必须是 genieVersion（不是 VS Code 基底 version）', async () => {
+  // ## 缺陷二：我们发的是 `product.json` 的 `version`，而客户端发 `genieVersion`
+  //
+  // 客户端 `getPlatformVersion()` 是
+  //   `if (product.genieVersion) return product.genieVersion; return version`
+  // **优先 genieVersion** —— `version` 只是缺失时的兜底。
+  //
+  // 本机实测：`version = 1.106.1`（VS Code 基底）而 `genieVersion = 4.12.2`（产品版本）
+  // ⇒ 我们此前发 `1.106.1` **等于报了一个客户端根本不会报的值**，
+  // 那不是「版本旧」，而是「另一个语义字段的值」—— 可聚类的异常指纹。
+  const { CODEBUDDY_CLIENT_VERSION, CODEBUDDY_USER_AGENT, CLIENT_VERSION_INTL, cliUserAgentIntl }
+    = await import('../src/upstream/headers.ts')
+
+  assert.equal(CODEBUDDY_CLIENT_VERSION, '4.12.2', '国内版必须用 genieVersion 4.12.2')
+  assert.equal(CODEBUDDY_USER_AGENT, 'CodeBuddyIDE/4.12.2', '⚠️ UA 必须与 X-IDE-Version 同值')
+  assert.equal(CLIENT_VERSION_INTL, '5.9.4', '国际版必须是 genieVersion 5.9.4')
+
+  // ⚠️ 反向：绝不能退回 VS Code 基底版本
+  assert.ok(!CODEBUDDY_USER_AGENT.includes('1.106'), '⚠️ 不得退回 VS Code 基底版本 1.106.1')
+
+  // ⚠️ 国际版 UA 三段必须同值（混用是国内/国际两个量，最容易露馅）
+  const ua = cliUserAgentIntl()
+  const parts = ua.match(/\d+\.\d+\.\d+/g) ?? []
+  assert.equal(new Set(parts).size, 1, `国际版 UA 三段必须同值，实际：${ua}`)
 })

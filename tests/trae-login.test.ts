@@ -597,7 +597,7 @@ test('⚠️ 失败必须写回会话（否则面板只会一直等到超时）'
 
 // ─────────────────── ⑥ 能力声明 ───────────────────
 
-test('❌ trae 必须声明 login=false —— 它强制回调 127.0.0.1，Worker 接不住', () => {
+test('✅ trae 可登录，但**只能**走「手动粘贴回调链接」（127.0.0.1 那条路依然不通）', () => {
   // ## 这是被真实用户实测推翻的结论（2026-10-04）
   //
   // 我曾以为 `auth_callback_url` 是通用参数、可以指向本服务 URL
@@ -614,11 +614,35 @@ test('❌ trae 必须声明 login=false —— 它强制回调 127.0.0.1，Worke
   // ⚠️ 那条错误文案在本仓库里搜不到，正是「不是我们的页面报的」的旁证。
   //
   // ⚠️ **不要靠「把地址换成本服务 URL」来修** —— 架构上不成立。
+  //
+  // ## ⇒ 2026-11-21：改走「手动粘贴回调链接」
+  //
+  // 上面那条事实**一个字没变**（TRAE 仍强制回调 127.0.0.1）。
+  // 变的是结论：既然回调必然打向用户本机、而**地址栏里带着完整凭证**，
+  // 那就让用户把那段 URL 粘回来 —— `/admin/providers/login/submit-callback`
+  // 用**同一份** `parseTraeCallback` 解析它。
+  //
+  // ⚠️ 这条路径与「把 auth_callback_url 指向本服务」是**两件事**，
+  // 别把本用例的放开误解成后者可行。
   const provider = findProvider('trae')
-  assert.equal(provider?.capabilities.login, false, 'trae 不能声称支持登录')
+  assert.equal(provider?.capabilities.login, true, 'trae 应声明可登录（手动回调路径）')
+
+  // ⚠️ 必须真的存在那条入口 —— 只翻 `login: true` 而没接线，
+  // 用户点「登录」会拿到「不支持从本服务发起登录」（正是本文件另一条用例守的东西）。
+  const index = readFileSync('src/index.ts', 'utf8')
   assert.ok(
-    (provider?.capabilities.loginBlockedReason ?? '').includes('127.0.0.1'),
-    '阻塞原因必须点明是「强制回调 127.0.0.1」，而不是含糊的「未实现」',
+    index.includes("'/admin/providers/login/submit-callback'"),
+    '必须存在手动提交回调的端点（否则 login:true 是空头承诺）',
+  )
+  // ⚠️ 且提交入口必须复用**同一个**解析函数，不得另写一份
+  //（本仓库反复踩过「同一个 bug 只修一半」）。
+  const i = index.indexOf("path === '/admin/providers/login/submit-callback'")
+  assert.ok(i >= 0)
+  const block = index.slice(i, i + 4000)
+  assert.ok(block.includes('parseTraeCallback('), '提交入口必须复用 parseTraeCallback')
+  assert.ok(
+    !/function parseTraeCallback/.test(block),
+    '不得在提交入口里另写一份解析（同一件事只能有一个实现）',
   )
 })
 
@@ -637,7 +661,19 @@ test('⚠️ 面板必须把 trae 标成「浏览器登录」（否则用户去�
   const js = readFileSync('src/panel/assets/app.js.txt', 'utf8')
   assert.ok(/LOGIN_KIND_LABEL\s*=\s*\{[^}]*trae:\s*'浏览器登录'/.test(js),
     'LOGIN_KIND_LABEL 必须含 trae: 浏览器登录')
-  assert.ok(/providerId === 'trae'/.test(js), 'loginWaitHint 必须覆盖 trae（回跳式流程的等待文案不同）')
+  // ⚠️ 2026-11-21：`loginWaitHint` 不再按 providerId 硬编码 trae ——
+  // 它改为查 `MANUAL_CALLBACK_PROVIDERS`（trae / lobsterai / gemini / raccoon 共用
+  // 同一句「请把地址栏链接粘回来」）。
+  // ⚠️ 原断言的**实质要求**仍然成立：trae 的等待文案必须覆盖到它
+  //（否则用户会一直等一个不会发生的跳转）。
+  assert.ok(
+    /MANUAL_CALLBACK_PROVIDERS\s*=\s*new Set\(\[[^\]]*'trae'/.test(js),
+    'trae 必须在 MANUAL_CALLBACK_PROVIDERS 里（等待文案据此分支）',
+  )
+  assert.ok(
+    /loginWaitHint\(providerId\)\s*\{[\s\S]{0,200}MANUAL_CALLBACK_PROVIDERS\.has\(providerId\)/.test(js),
+    'loginWaitHint 必须用该集合判断，而不是硬编码单个 provider',
+  )
 })
 
 test('⚠️ 零 node: 导入（Workers 只能跑纯 Web 标准）', () => {
